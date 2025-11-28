@@ -68,24 +68,16 @@ float targetLux[3]        = {1000.0f, 1000.0f, 1000.0f};
 float correctionFeed[3]   = {0.0f, 0.0f, 0.0f};
 unsigned long correctionStamp[3] = {0, 0, 0};
 
-float pidCommand[3]       = {300.0f, 300.0f, 300.0f};
-float Kp_pid = 0.045f;
-float Ki_pid = 0.0018f;
-float Kd_pid = 0.0f;
+float percentSmooth[3]     = {30.0f, 30.0f, 30.0f};
+float sensorFiltered[3]    = {0.0f, 0.0f, 0.0f};
+float channelKp[3]         = {0.08f, 0.08f, 0.08f};
+float diffThreshold[3]     = {100.0f, 100.0f, 100.0f};
+float diffRange[3]         = {2500.0f, 2500.0f, 2500.0f};
+float channelMin[3]        = {10.0f, 10.0f, 10.0f};
+float channelMax[3]        = {1000.0f, 1000.0f, 1000.0f};
 
 bool remoteGuard = false;
-
-struct ChannelPidState {
-    float integral;
-    float prevErr;
-    float filtered;
-};
-
-ChannelPidState pidState[3] = {
-    {0.0f, 0.0f, 0.0f},
-    {0.0f, 0.0f, 0.0f},
-    {0.0f, 0.0f, 0.0f}
-};
+bool manualGuard = false;
 
 int prevSentLevel[3]      = {-1, -1, -1};
 unsigned long lastSendTime[3] = {0, 0, 0};
@@ -352,10 +344,15 @@ bool applyTriacLevel(int idx, int inputLevel, bool forceSend) {
     return ok;
 }
 
-void setMode(int newMode, bool allowRemoteOverride = false) {
+void setMode(int newMode, bool allowRemoteOverride = false, bool explicitCommand = false) {
     if (newMode < MODE_AUTO) newMode = MODE_AUTO;
     if (newMode > MODE_REMOTE) newMode = MODE_REMOTE;
     bool wantsRemote = (newMode == MODE_REMOTE);
+
+    if (manualGuard && mode == MODE_MANUAL && newMode != MODE_MANUAL && !explicitCommand) {
+        Serial.printf("[MODE] manual lock ignores %d\n", newMode);
+        return;
+    }
 
     if (remoteGuard && !allowRemoteOverride && !wantsRemote) {
         Serial.printf("[MODE] ignore %d while REMOTE locked\n", newMode);
@@ -366,6 +363,12 @@ void setMode(int newMode, bool allowRemoteOverride = false) {
         remoteGuard = true;
     } else if (remoteGuard && allowRemoteOverride) {
         remoteGuard = false;
+    }
+
+    if (newMode == MODE_MANUAL) {
+        manualGuard = true;
+    } else if (explicitCommand) {
+        manualGuard = false;
     }
 
     if (mode == newMode) {
@@ -407,9 +410,9 @@ void setTriacEnabled(int idx, bool value) {
     Serial.printf("[ENABLE] triac %d -> %d\n", idx, value ? 1 : 0);
 
     if (!value) {
-        pidCommand[idx] = 0.0f;
         lastCommandedLevel[idx] = 0;
         manualLevel[idx] = 0;
+        percentSmooth[idx] = 0.0f;
         if (!remoteGuard) {
             applyTriacLevel(idx, 0, true);
         }
@@ -425,7 +428,6 @@ void queueManualApply(bool forceAll) {
 void applyManualLevels() {
     if (remoteGuard) return;
     for (int i = 0; i < 3; ++i) {
-        pidCommand[i] = manualLevel[i];
         lastCommandedLevel[i] = manualLevel[i];
         applyTriacLevel(i, manualLevel[i], manualForceSend);
     }
@@ -447,7 +449,7 @@ void handleManualArray(const JsonArray& arr, bool isRemoteContext) {
     }
 
     if (mode != MODE_MANUAL)
-        setMode(MODE_MANUAL);
+        setMode(MODE_MANUAL, false, true);
 
     queueManualApply(true);
 }
@@ -463,7 +465,7 @@ void handleTriacLevelCommand(int idx, int lvl, bool isRemoteContext) {
     }
 
     if (mode != MODE_MANUAL)
-        setMode(MODE_MANUAL);
+        setMode(MODE_MANUAL, false, true);
 
     queueManualApply(true);
 }
@@ -502,40 +504,30 @@ float getActiveCorrection(int idx, unsigned long nowMs) {
     return 0.0f;
 }
 
-int computePidLevel(int idx, float measurement, float target, float dt) {
+int computeSmoothLevel(int idx, float measurement, float target) {
     if (!triacEnabled[idx]) {
-        pidState[idx].integral = 0.0f;
-        pidState[idx].prevErr = 0.0f;
-        pidCommand[idx] = 0.0f;
+        percentSmooth[idx] = 0.0f;
         return 0;
     }
 
-    float err = target - measurement;
-    float absErr = fabs(err);
+    float diff = target - measurement;
+    float absDiff = fabsf(diff);
 
-    if (absErr < PID_HOLD_BAND) {
-        pidState[idx].integral *= 0.98f;
-        pidState[idx].prevErr = err;
-        return (int)round(pidCommand[idx]);
+    if (absDiff < diffThreshold[idx]) {
+        percentSmooth[idx] += (50.0f - percentSmooth[idx]) * 0.05f;
+    } else {
+        float halfRange = diffRange[idx];
+        if (halfRange < 1.0f) halfRange = 1.0f;
+        float mapped = (diff + halfRange) / (2.0f * halfRange);
+        float targetPercent = constrain(mapped * 100.0f, 0.0f, 100.0f);
+        percentSmooth[idx] += (targetPercent - percentSmooth[idx]) * channelKp[idx];
     }
 
-    pidState[idx].integral += err * dt;
-    pidState[idx].integral = constrain(pidState[idx].integral,
-                                       -PID_INTEGRAL_CLAMP, PID_INTEGRAL_CLAMP);
-
-    float derivative = (err - pidState[idx].prevErr) / max(dt, PID_D_MIN_DT);
-    pidState[idx].prevErr = err;
-
-    float kp = Kp_pid;
-    if (absErr > 400.0f) kp *= 2.5f;
-    else if (absErr > 200.0f) kp *= 1.6f;
-
-    float delta = kp * err + Ki_pid * pidState[idx].integral + Kd_pid * derivative;
-    float candidate = pidCommand[idx] + delta;
-    candidate = constrain(candidate, 0.0f, 1000.0f);
-
-    pidCommand[idx] = pidCommand[idx] + (candidate - pidCommand[idx]) * PID_OUTPUT_ALPHA;
-    return (int)round(pidCommand[idx]);
+    percentSmooth[idx] = constrain(percentSmooth[idx], 0.0f, 100.0f);
+    float minB = channelMin[idx];
+    float maxB = channelMax[idx];
+    float level = minB + (maxB - minB) * (percentSmooth[idx] / 100.0f);
+    return (int)roundf(level);
 }
 
 void sendLog(float s[3], int lvl[3], unsigned long nowMs) {
@@ -577,10 +569,10 @@ void dimmingLoop() {
     };
 
     for (int i = 0; i < 3; ++i) {
-        if (pidState[i].filtered == 0.0f)
-            pidState[i].filtered = rawSensors[i];
+        if (sensorFiltered[i] == 0.0f)
+            sensorFiltered[i] = rawSensors[i];
         else
-            pidState[i].filtered += SENSOR_ALPHA * (rawSensors[i] - pidState[i].filtered);
+            sensorFiltered[i] += SENSOR_ALPHA * (rawSensors[i] - sensorFiltered[i]);
     }
 
     if (remoteGuard) {
@@ -596,19 +588,19 @@ void dimmingLoop() {
 
         if (!triacEnabled[i]) {
             levelOut = 0;
-            pidCommand[i] = 0.0f;
+            percentSmooth[i] = 0.0f;
         }
         else if (mode == MODE_MANUAL) {
             levelOut = manualLevel[i];
         }
         else if (mode == MODE_AUTO) {
-            levelOut = computePidLevel(i, pidState[i].filtered, targetLux[i], dt);
+            levelOut = computeSmoothLevel(i, sensorFiltered[i], targetLux[i]);
         }
         else if (mode == MODE_TEST) {
             float corr = getActiveCorrection(i, nowMs);
             float effectiveTarget = targetLux[i] - corr;
             if (effectiveTarget < 0.0f) effectiveTarget = 0.0f;
-            levelOut = computePidLevel(i, pidState[i].filtered, effectiveTarget, dt);
+            levelOut = computeSmoothLevel(i, sensorFiltered[i], effectiveTarget);
         }
         else if (mode == MODE_RECORD) {
             levelOut = 0;
@@ -641,8 +633,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             return;
         }
 
+        bool explicitModeCmd = doc.containsKey("mode_cmd") ? doc["mode_cmd"].as<bool>() : false;
         if (doc.containsKey("mode")) {
-            setMode(doc["mode"].as<int>(), true);
+            setMode(doc["mode"].as<int>(), true, explicitModeCmd);
         }
 
         bool isRemote = remoteGuard;
@@ -663,7 +656,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             for (int i = 0; i < 3; ++i)
                 manualLevel[i] = on ? 1000 : 0;
             if (!isRemote) {
-                setMode(MODE_MANUAL);
+                setMode(MODE_MANUAL, false, true);
                 queueManualApply(true);
             }
         }
@@ -691,19 +684,6 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                     targetLux[i] = v;
             }
             Serial.printf("[WS] targetLux -> %.1f %.1f %.1f\n", targetLux[0], targetLux[1], targetLux[2]);
-        }
-
-        if (doc.containsKey("Kp")) {
-            Kp_pid = doc["Kp"].as<float>();
-            Serial.printf("[WS] Kp=%f\n", Kp_pid);
-        }
-        if (doc.containsKey("Ki")) {
-            Ki_pid = doc["Ki"].as<float>();
-            Serial.printf("[WS] Ki=%f\n", Ki_pid);
-        }
-        if (doc.containsKey("Kd")) {
-            Kd_pid = doc["Kd"].as<float>();
-            Serial.printf("[WS] Kd=%f\n", Kd_pid);
         }
 
     } else if (type == WStype_CONNECTED) {
