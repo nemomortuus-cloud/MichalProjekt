@@ -72,6 +72,8 @@ float Kp_pid = 0.045f;
 float Ki_pid = 0.0018f;
 float Kd_pid = 0.0f;
 
+bool remoteGuard = false;
+
 struct ChannelPidState {
     float integral;
     float prevErr;
@@ -328,7 +330,7 @@ bool pushTriacToTuya(int index, int inputLevel) {
 }
 
 bool applyTriacLevel(int idx, int inputLevel, bool forceSend) {
-    if (mode == MODE_REMOTE) return false;
+    if (remoteGuard) return false;
     int target = constrain(inputLevel, 0, 1000);
     int normalized = normalizeLevel(target);
     int cmp = normalized < 0 ? 0 : normalized;
@@ -349,20 +351,43 @@ bool applyTriacLevel(int idx, int inputLevel, bool forceSend) {
     return ok;
 }
 
-void setMode(int newMode) {
+void setMode(int newMode, bool allowRemoteOverride = false) {
     if (newMode < MODE_AUTO) newMode = MODE_AUTO;
     if (newMode > MODE_REMOTE) newMode = MODE_REMOTE;
-    if (mode == newMode) return;
+    bool wantsRemote = (newMode == MODE_REMOTE);
 
-    Serial.printf("[MODE] %d -> %d\n", mode, newMode);
+    if (remoteGuard && !allowRemoteOverride && !wantsRemote) {
+        Serial.printf("[MODE] ignore %d while REMOTE locked\n", newMode);
+        return;
+    }
+
+    if (wantsRemote) {
+        remoteGuard = true;
+    } else if (remoteGuard && allowRemoteOverride) {
+        remoteGuard = false;
+    }
+
+    if (mode == newMode) {
+        if (remoteGuard) {
+            manualApplyPending = false;
+            manualForceSend = false;
+            for (int i = 0; i < 3; ++i) {
+                prevSentLevel[i] = -1;
+            }
+        }
+        return;
+    }
+
+    Serial.printf("[MODE] %d -> %d%s\n", mode, newMode, remoteGuard ? " [REMOTE]" : "");
     mode = newMode;
 
-    if (mode == MODE_REMOTE) {
+    if (remoteGuard) {
         manualApplyPending = false;
         manualForceSend = false;
         for (int i = 0; i < 3; ++i) {
             prevSentLevel[i] = -1;
         }
+        return;
     }
 
     if (mode == MODE_RECORD) {
@@ -384,20 +409,20 @@ void setTriacEnabled(int idx, bool value) {
         pidCommand[idx] = 0.0f;
         lastCommandedLevel[idx] = 0;
         manualLevel[idx] = 0;
-        if (mode != MODE_REMOTE) {
+        if (!remoteGuard) {
             applyTriacLevel(idx, 0, true);
         }
     }
 }
 
 void queueManualApply(bool forceAll) {
-    if (mode == MODE_REMOTE) return;
+    if (remoteGuard) return;
     manualApplyPending = true;
     manualForceSend |= forceAll;
 }
 
 void applyManualLevels() {
-    if (mode == MODE_REMOTE) return;
+    if (remoteGuard) return;
     for (int i = 0; i < 3; ++i) {
         pidCommand[i] = manualLevel[i];
         lastCommandedLevel[i] = manualLevel[i];
@@ -549,7 +574,7 @@ void dimmingLoop() {
             pidState[i].filtered += SENSOR_ALPHA * (rawSensors[i] - pidState[i].filtered);
     }
 
-    if (mode == MODE_REMOTE) {
+    if (remoteGuard) {
         sendLog(rawSensors, lastCommandedLevel);
         return;
     }
@@ -582,10 +607,10 @@ void dimmingLoop() {
         levelOut = constrain(levelOut, 0, 1000);
         lastCommandedLevel[i] = levelOut;
 
-        if (mode == MODE_AUTO || mode == MODE_TEST || mode == MODE_MANUAL) {
+        if (!remoteGuard && (mode == MODE_AUTO || mode == MODE_TEST || mode == MODE_MANUAL)) {
             bool force = (mode == MODE_MANUAL);
             applyTriacLevel(i, levelOut, force);
-        } else if (mode == MODE_RECORD) {
+        } else if (!remoteGuard && mode == MODE_RECORD) {
             applyTriacLevel(i, 0, true);
         }
     }
@@ -607,10 +632,10 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         }
 
         if (doc.containsKey("mode")) {
-            setMode(doc["mode"].as<int>());
+            setMode(doc["mode"].as<int>(), true);
         }
 
-        bool isRemote = (mode == MODE_REMOTE);
+        bool isRemote = remoteGuard;
 
         if (doc.containsKey("manual")) {
             JsonArray arr = doc["manual"].as<JsonArray>();
