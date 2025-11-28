@@ -77,7 +77,6 @@ float channelMin[3]        = {10.0f, 10.0f, 10.0f};
 float channelMax[3]        = {1000.0f, 1000.0f, 1000.0f};
 
 bool remoteGuard = false;
-bool manualGuard = false;
 
 int prevSentLevel[3]      = {-1, -1, -1};
 unsigned long lastSendTime[3] = {0, 0, 0};
@@ -344,15 +343,10 @@ bool applyTriacLevel(int idx, int inputLevel, bool forceSend) {
     return ok;
 }
 
-void setMode(int newMode, bool allowRemoteOverride = false, bool explicitCommand = false) {
+void setMode(int newMode, bool allowRemoteOverride = false) {
     if (newMode < MODE_AUTO) newMode = MODE_AUTO;
     if (newMode > MODE_REMOTE) newMode = MODE_REMOTE;
     bool wantsRemote = (newMode == MODE_REMOTE);
-
-    if (manualGuard && mode == MODE_MANUAL && newMode != MODE_MANUAL && !explicitCommand) {
-        Serial.printf("[MODE] manual lock ignores %d\n", newMode);
-        return;
-    }
 
     if (remoteGuard && !allowRemoteOverride && !wantsRemote) {
         Serial.printf("[MODE] ignore %d while REMOTE locked\n", newMode);
@@ -363,12 +357,6 @@ void setMode(int newMode, bool allowRemoteOverride = false, bool explicitCommand
         remoteGuard = true;
     } else if (remoteGuard && allowRemoteOverride) {
         remoteGuard = false;
-    }
-
-    if (newMode == MODE_MANUAL) {
-        manualGuard = true;
-    } else if (explicitCommand) {
-        manualGuard = false;
     }
 
     if (mode == newMode) {
@@ -449,7 +437,7 @@ void handleManualArray(const JsonArray& arr, bool isRemoteContext) {
     }
 
     if (mode != MODE_MANUAL)
-        setMode(MODE_MANUAL, false, true);
+        setMode(MODE_MANUAL);
 
     queueManualApply(true);
 }
@@ -465,7 +453,7 @@ void handleTriacLevelCommand(int idx, int lvl, bool isRemoteContext) {
     }
 
     if (mode != MODE_MANUAL)
-        setMode(MODE_MANUAL, false, true);
+        setMode(MODE_MANUAL);
 
     queueManualApply(true);
 }
@@ -633,9 +621,8 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             return;
         }
 
-        bool explicitModeCmd = doc.containsKey("mode_cmd") ? doc["mode_cmd"].as<bool>() : false;
         if (doc.containsKey("mode")) {
-            setMode(doc["mode"].as<int>(), true, explicitModeCmd);
+            setMode(doc["mode"].as<int>(), true);
         }
 
         bool isRemote = remoteGuard;
@@ -656,7 +643,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             for (int i = 0; i < 3; ++i)
                 manualLevel[i] = on ? 1000 : 0;
             if (!isRemote) {
-                setMode(MODE_MANUAL, false, true);
+                setMode(MODE_MANUAL);
                 queueManualApply(true);
             }
         }
