@@ -49,6 +49,7 @@ const float    PID_INTEGRAL_CLAMP      = 2500.0f;
 const float    PID_D_MIN_DT            = 0.001f;
 const unsigned long MIN_SEND_INTERVAL_MS = 90;
 const int LEVEL_CHANGE_THRESHOLD       = 3;
+const unsigned long CORRECTION_TTL_MS  = 1000;
 
 // ===================== Modes =====================
 const int MODE_AUTO   = 0;
@@ -493,6 +494,14 @@ void handleCorrectionArray(const JsonArray& arr) {
                   correctionFeed[0], correctionFeed[1], correctionFeed[2]);
 }
 
+float getActiveCorrection(int idx, unsigned long nowMs) {
+    if (idx < 0 || idx > 2) return 0.0f;
+    unsigned long stamp = correctionStamp[idx];
+    unsigned long age = (nowMs >= stamp) ? (nowMs - stamp) : 0;
+    if (age <= CORRECTION_TTL_MS) return correctionFeed[idx];
+    return 0.0f;
+}
+
 int computePidLevel(int idx, float measurement, float target, float dt) {
     if (!triacEnabled[idx]) {
         pidState[idx].integral = 0.0f;
@@ -529,12 +538,12 @@ int computePidLevel(int idx, float measurement, float target, float dt) {
     return (int)round(pidCommand[idx]);
 }
 
-void sendLog(float s[3], int lvl[3]) {
+void sendLog(float s[3], int lvl[3], unsigned long nowMs) {
     DynamicJsonDocument doc(256);
     for (int i = 0; i < 3; i++) {
         doc["s"][i]          = s[i];
         doc["level"][i]      = lvl[i];
-        doc["correction"][i] = correctionFeed[i];
+        doc["correction"][i] = getActiveCorrection(i, nowMs);
     }
     doc["mode"] = mode;
 
@@ -575,7 +584,7 @@ void dimmingLoop() {
     }
 
     if (remoteGuard) {
-        sendLog(rawSensors, lastCommandedLevel);
+        sendLog(rawSensors, lastCommandedLevel, nowMs);
         return;
     }
 
@@ -596,7 +605,8 @@ void dimmingLoop() {
             levelOut = computePidLevel(i, pidState[i].filtered, targetLux[i], dt);
         }
         else if (mode == MODE_TEST) {
-            float effectiveTarget = targetLux[i] - correctionFeed[i];
+            float corr = getActiveCorrection(i, nowMs);
+            float effectiveTarget = targetLux[i] - corr;
             if (effectiveTarget < 0.0f) effectiveTarget = 0.0f;
             levelOut = computePidLevel(i, pidState[i].filtered, effectiveTarget, dt);
         }
@@ -615,7 +625,7 @@ void dimmingLoop() {
         }
     }
 
-    sendLog(rawSensors, lastCommandedLevel);
+    sendLog(rawSensors, lastCommandedLevel, nowMs);
 }
 
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
